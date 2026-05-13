@@ -1,0 +1,750 @@
+import time
+import os
+import csv
+from datetime import datetime, timedelta, time
+from zoneinfo import ZoneInfo
+import time as sleep_time
+
+import pandas as pd
+from dotenv import load_dotenv
+
+from alpaca.trading.client import TradingClient
+from alpaca.trading.requests import MarketOrderRequest, TakeProfitRequest, StopLossRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass, AssetStatus
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest
+from alpaca.data.timeframe import TimeFrame
+
+
+load_dotenv()
+
+API_KEY = os.getenv("ALPACA_API_KEY")
+SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
+
+PAPER_TRADING = True
+
+USE_AUTO_SCANNER = True
+MAX_SYMBOLS_TO_SCAN = 500
+MAX_CANDIDATES_TO_TRADE = 10
+
+MANUAL_WATCHLIST = [
+    "AAPL",
+    "AMD",
+    "NVDA",
+    "TSLA",
+    "MSFT",
+    "META",
+    "AMZN",
+    "GOOGL"]
+
+MAX_RISK_PER_TRADE = 0.01
+MAX_DAILY_LOSS_PERCENT = 0.02
+MAX_OPEN_TRADES = 4
+MAX_TRADES_PER_DAY = 3
+ENABLE_BREAKOUT = True
+ENABLE_PULLBACK = True
+MAX_TRADES_BREAKOUT = 2
+MAX_TRADES_PULLBACK = 1
+MAX_RISK_PER_TRADE_BREAKOUT = 0.01
+MAX_RISK_PER_TRADE_PULLBACK = 0.005
+
+MIN_STOCK_PRICE = 10
+MAX_STOCK_PRICE = 750
+MIN_AVG_VOLUME = 250_000
+MAX_DOLLARS_PER_TRADE = 750
+MIN_RELATIVE_VOLUME = 1.2
+MIN_DAILY_GAIN_PERCENT = 0.005
+MIN_DOLLAR_VOLUME = 50_000_000
+EXCLUDE_SYMBOLS = ["NAT", "SQQQ", "TQQQ", "UVXY", "VXX"]
+MIN_BREAKOUT_REL_VOLUME = 1.1
+MAX_EXTENSION_FROM_SMA20 = 0.10
+MAX_PULLBACK_DEPTH = 0.05
+MIN_PULLBACK_RECOVERY_VOLUME = 0.8
+MIN_PULLBACK_REL_VOLUME = 1.0
+
+USE_TRAILING_STOP = False
+
+TAKE_PROFIT_R_MULTIPLE = 2.0
+STOP_BUFFER_PERCENT = 0.01
+CLOSE_POSITIONS_AFTER = time(15, 30)
+CLOSE_POSITIONS_CUTOFF = time(15, 55)
+
+TRAILING_STOP_PERCENT = 3.0
+
+
+LOG_FILE = "trade_log.csv"
+
+trading_client = TradingClient(API_KEY, SECRET_KEY, paper=PAPER_TRADING)
+data_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
+
+
+def log_event(
+    symbol,
+    decision,
+    reason,
+    entry=None,
+    stop=None,
+    target=None,
+    qty=None,
+    model=None):
+    file_exists = os.path.isfile(LOG_FILE)
+
+    with open(LOG_FILE, mode="a", newline="") as file:
+        writer = csv.writer(file)
+
+        if not file_exists:
+            writer.writerow([
+                "timestamp", "symbol", "decision", "reason",
+                "entry", "stop", "target", "qty", "model"
+            ])
+
+        writer.writerow([
+            datetime.now().isoformat(),
+            symbol,
+            decision,
+            reason,
+            entry,
+            stop,
+            target,
+            qty,
+            model
+        ])
+
+
+def market_is_open():
+    clock = trading_client.get_clock()
+    return clock.is_open
+
+
+def trading_time_window_check():
+    now = datetime.now(ZoneInfo("America/New_York")).time()
+
+    morning_start = time(9, 45)
+    morning_end = time(11, 30)
+
+    afternoon_start = time(14, 0)
+    afternoon_end = time(15, 30)
+
+    if morning_start <= now <= morning_end:
+        return True, "Morning trading window approved"
+
+    if afternoon_start <= now <= afternoon_end:
+        return True, "Afternoon trading window approved"
+
+    return False, "Outside approved trading time window"
+
+
+def daily_loss_check():
+    account = trading_client.get_account()
+
+    equity = float(account.equity)
+    last_equity = float(account.last_equity)
+
+    daily_change_percent = (equity - last_equity) / last_equity
+
+    if daily_change_percent <= -MAX_DAILY_LOSS_PERCENT:
+        return False, f"Daily loss limit hit: {daily_change_percent:.2%}"
+
+    return True, f"Daily loss check passed: {daily_change_percent:.2%}"
+
+
+def get_account_equity():
+    account = trading_client.get_account()
+    return float(account.equity)
+
+
+def get_open_positions_count():
+    positions = trading_client.get_all_positions()
+    return len(positions)
+
+
+def get_daily_bars(symbol, days=60):
+    end = datetime.now(ZoneInfo("America/New_York"))
+    start = end - timedelta(days=days)
+
+    request = StockBarsRequest(
+        symbol_or_symbols=symbol,
+        timeframe=TimeFrame.Day,
+        start=start,
+        end=end,
+        feed="iex"
+    )
+
+    bars = data_client.get_stock_bars(request).df
+
+    if bars.empty:
+        return pd.DataFrame()
+
+    if isinstance(bars.index, pd.MultiIndex):
+        try:
+            bars = bars.xs(symbol)
+        except KeyError:
+            return pd.DataFrame()
+
+    return bars
+
+
+def spy_market_filter():
+    bars = get_daily_bars("SPY", days=120)
+
+    if len(bars) < 20:
+        return False, f"Not enough SPY data. Only got {len(bars)} bars"
+
+    spy_close = float(bars.iloc[-1]["close"])
+    spy_sma_20 = bars["close"].tail(20).mean()
+
+    if spy_close < spy_sma_20:
+        return False, "SPY below 20-day moving average"
+
+    return True, "SPY market filter approved"
+
+
+def already_in_position(symbol):
+    try:
+        positions = trading_client.get_all_positions()
+
+        for pos in positions:
+            if pos.symbol == symbol:
+                return True, "Already holding position"
+
+        orders = trading_client.get_orders()
+
+        for order in orders:
+            if order.symbol == symbol:
+                return True, "Open order already exists"
+
+        return False, "No existing position"
+
+    except Exception as e:
+        return True, f"Position check error: {e}"
+
+    preferred = [
+        "AAPL", "MSFT", "NVDA", "AMD", "TSLA", "META", "AMZN", "GOOGL",
+        "NFLX", "PLTR", "COIN", "SOFI", "RIVN", "SMCI", "AVGO",
+        "QQQ", "SPY", "IWM"
+    ]
+
+    final_symbols = preferred + [s for s in symbols if s not in preferred]
+
+    return final_symbols[:MAX_SYMBOLS_TO_SCAN]
+
+
+def get_tradable_symbols():
+    assets = trading_client.get_all_assets()
+    symbols = []
+
+    allowed_exchanges = ["NASDAQ", "NYSE", "ARCA", "AMEX"]
+
+    for asset in assets:
+        if not asset.tradable:
+            continue
+
+        if asset.asset_class != "us_equity":
+            continue
+
+        if asset.exchange not in allowed_exchanges:
+            continue
+
+        if "." in asset.symbol or "/" in asset.symbol or "-" in asset.symbol:
+            continue
+
+        if asset.symbol in EXCLUDE_SYMBOLS:
+            continue
+
+        symbols.append(asset.symbol)
+
+    return symbols
+
+
+def scan_stock(symbol):
+    bars = get_daily_bars(symbol)
+
+    if len(bars) < 25:
+        return None
+
+    today = bars.iloc[-1]
+    yesterday = bars.iloc[-2]
+
+    close = float(today["close"])
+    prior_close = float(yesterday["close"])
+    volume = float(today["volume"])
+    avg_volume = float(bars["volume"].tail(20).mean())
+
+    if close < MIN_STOCK_PRICE or close > MAX_STOCK_PRICE:
+        return None
+
+    if avg_volume < MIN_AVG_VOLUME:
+        return None
+
+    percent_change = (close - prior_close) / prior_close
+    relative_volume = volume / avg_volume if avg_volume > 0 else 0
+
+    score = (percent_change * 100) + relative_volume
+
+    return {
+        "symbol": symbol,
+        "close": close,
+        "percent_change": percent_change,
+        "relative_volume": relative_volume,
+        "score": score
+    }
+
+
+def build_auto_watchlist():
+    print("Building auto watchlist...")
+
+    symbols = get_tradable_symbols()
+    candidates = []
+
+    for symbol in symbols:
+        try:
+            result = scan_stock(symbol)
+
+            if result:
+                candidates.append(result)
+
+        except Exception as e:
+            log_event(symbol, "SCAN_ERROR", str(e))
+
+    candidates = sorted(candidates, key=lambda x: x["score"], reverse=True)
+
+    selected = [item["symbol"]
+                for item in candidates[:MAX_CANDIDATES_TO_TRADE]]
+
+    print(f"Auto watchlist selected: {selected}")
+
+    for item in candidates[:MAX_CANDIDATES_TO_TRADE]:
+        log_event(
+            item["symbol"],
+            "SCANNER_SELECTED",
+            f"Score={item['score']:.2f}, Change={item['percent_change']:.2%}, RelVol={item['relative_volume']:.2f}"
+        )
+
+    return selected
+
+
+def breakout_signal(symbol):
+    bars = get_daily_bars(symbol, days=90)
+
+    if len(bars) < 50:
+        return None, "Not enough data"
+
+    yesterday = bars.iloc[-2]
+    today = bars.iloc[-1]
+
+    avg_volume = bars["volume"].tail(20).mean()
+    current_volume = float(today["volume"])
+    current_price = float(today["close"])
+    prior_high = float(yesterday["high"])
+
+    sma_20 = bars["close"].tail(20).mean()
+    sma_50 = bars["close"].tail(50).mean()
+
+    relative_volume = current_volume / avg_volume if avg_volume > 0 else 0
+    extension_from_sma20 = (current_price - sma_20) / sma_20
+
+    if current_price < MIN_STOCK_PRICE:
+        return None, "Price too low"
+
+    if current_price > MAX_STOCK_PRICE:
+        return None, "Price too high"
+
+    if avg_volume < MIN_AVG_VOLUME:
+        return None, "Volume too low"
+
+    if current_price < sma_20 or current_price < sma_50:
+        return None, "Not in uptrend"
+
+    if relative_volume < MIN_BREAKOUT_REL_VOLUME:
+        return None, "Breakout volume too weak"
+
+    if extension_from_sma20 > MAX_EXTENSION_FROM_SMA20:
+        return None, "Too extended from 20-day average"
+
+    if current_price <= prior_high:
+        return None, "No breakout"
+
+        entry = round(current_price, 2)
+    stop = round(entry - 1.50, 2)
+    target = round(entry + 3.00, 2)
+
+    risk_per_share = entry - stop
+
+    if risk_per_share <= 0:
+        return None, "Invalid risk setup"
+
+    return {
+        "symbol": symbol,
+        "entry": entry,
+        "stop": stop,
+        "target": target,
+        "risk_per_share": risk_per_share,
+        "model": "breakout"
+    }, "Valid tightened breakout"
+
+
+def calculate_position_size(account_equity, risk_per_share):
+    max_risk = account_equity * MAX_RISK_PER_TRADE
+    qty = int(max_risk / risk_per_share)
+    return max(qty, 0)
+
+
+def pullback_signal(symbol):
+    bars = get_daily_bars(symbol, days=90)
+
+    if len(bars) < 50:
+        return None, "Not enough data for pullback"
+
+    today = bars.iloc[-1]
+    yesterday = bars.iloc[-2]
+    two_days_ago = bars.iloc[-3]
+
+    close = float(today["close"])
+    open_price = float(today["open"])
+    yesterday_close = float(yesterday["close"])
+    two_days_ago_close = float(two_days_ago["close"])
+
+    avg_volume = bars["volume"].tail(20).mean()
+    current_volume = float(today["volume"])
+    relative_volume = current_volume / avg_volume if avg_volume > 0 else 0
+
+    sma_20 = bars["close"].tail(20).mean()
+    sma_50 = bars["close"].tail(50).mean()
+
+    if close < MIN_STOCK_PRICE or close > MAX_STOCK_PRICE:
+        return None, "Price outside range"
+
+    if avg_volume < MIN_AVG_VOLUME:
+        return None, "Volume too low"
+
+    if close < sma_20 or close < sma_50:
+        return None, "Not in uptrend"
+
+    if sma_20 < sma_50:
+        return None, "Trend not strong enough"
+
+    pullback_depth = (two_days_ago_close - yesterday_close) / \
+    two_days_ago_close
+
+    if pullback_depth <= 0:
+        return None, "No pullback"
+
+    if pullback_depth > MAX_PULLBACK_DEPTH:
+        return None, "Pullback too deep"
+
+    if close <= yesterday_close:
+        return None, "No recovery"
+
+    if close <= open_price:
+        return None, "Recovery candle not green"
+
+    if relative_volume < MIN_PULLBACK_RECOVERY_VOLUME:
+        return None, "Recovery volume too weak"
+
+    entry = round(close, 2)
+    stop = round(entry - 1.50, 2)
+    target = round(entry + 3.00, 2)
+
+    risk_per_share = entry - stop
+
+    if risk_per_share <= 0:
+        return None, "Invalid pullback risk"
+
+    target = round(entry + risk_per_share * TAKE_PROFIT_R_MULTIPLE, 2)
+
+    return {
+        "symbol": symbol,
+        "entry": entry,
+        "stop": stop,
+        "target": target,
+        "risk_per_share": risk_per_share,
+        "model": "pullback"
+    }, "Valid tightened pullback"
+
+
+def risk_check(signal):
+    equity = get_account_equity()
+    open_positions = get_open_positions_count()
+
+    if open_positions >= MAX_OPEN_TRADES:
+        return False, "Too many open trades", 0
+
+    qty = calculate_position_size(equity, signal["risk_per_share"])
+
+    if qty < 1:
+        return False, "Position size too small", 0
+
+    # limit by account equity
+    if qty * signal["entry"] > equity:
+        qty = int(equity / signal["entry"])
+
+    # limit by max dollars per trade
+    if qty * signal["entry"] > MAX_DOLLARS_PER_TRADE:
+        qty = int(MAX_DOLLARS_PER_TRADE / signal["entry"])
+
+    if qty < 1:
+        return False, "Trade exceeds max dollar limit", 0
+
+    return True, "Risk approved", qty
+
+
+def place_trade(signal, qty):
+    if USE_TRAILING_STOP:
+        from alpaca.trading.requests import TrailingStopOrderRequest
+
+        order = TrailingStopOrderRequest(
+            symbol=signal["symbol"],
+            qty=qty,
+            side=OrderSide.BUY,
+            time_in_force=TimeInForce.DAY,
+            trail_percent=TRAILING_STOP_PERCENT
+        )
+
+        return trading_client.submit_order(order)
+
+    order = MarketOrderRequest(
+        symbol=signal["symbol"],
+        qty=qty,
+        side=OrderSide.BUY,
+        time_in_force=TimeInForce.DAY,
+        order_class=OrderClass.BRACKET,
+        take_profit=TakeProfitRequest(limit_price=signal["target"]),
+        stop_loss=StopLossRequest(stop_price=signal["stop"])
+    )
+
+    return trading_client.submit_order(order)
+
+
+def trades_placed_today():
+    if not os.path.isfile(LOG_FILE):
+        return 0
+
+    today = datetime.now().date()
+    count = 0
+
+    with open(LOG_FILE, mode="r", newline="") as file:
+        reader = csv.DictReader(file)
+
+        for row in reader:
+            try:
+                row_date = datetime.fromisoformat(row["timestamp"]).date()
+
+                if row_date == today and row["decision"] == "TRADE_PLACED":
+                    count += 1
+
+            except Exception:
+                continue
+
+    return count
+
+
+def print_account_status():
+    try:
+        account = trading_client.get_account()
+
+        equity = float(account.equity)
+        last_equity = float(account.last_equity)
+        cash = float(account.cash)
+
+        daily_pl = equity - last_equity
+        daily_pl_percent = (daily_pl / last_equity) * 100
+
+        positions = trading_client.get_all_positions()
+
+        print("\n===== ACCOUNT STATUS =====")
+        print(f"Equity: ${equity:,.2f}")
+        print(f"Cash: ${cash:,.2f}")
+        print(f"Daily P/L: ${daily_pl:,.2f} ({daily_pl_percent:.2f}%)")
+        print(f"Open Positions: {len(positions)}")
+        print("==========================\n")
+
+    except Exception as e:
+        print(f"Account status error: {e}")
+
+
+def close_positions_near_market_close():
+    now = datetime.now(ZoneInfo("America/New_York")).time()
+
+    if now < CLOSE_POSITIONS_AFTER:
+        return False, "Not time to close positions yet"
+
+    if now > CLOSE_POSITIONS_CUTOFF:
+        return True, "Past EOD closeout cutoff — no new close orders submitted"
+
+    positions = trading_client.get_all_positions()
+
+    if not positions:
+        return True, "No open positions to close"
+
+    try:
+        trading_client.cancel_orders()
+        print("Canceled open orders before EOD closeout")
+        log_event(
+            "ACCOUNT",
+            "CANCEL_ORDERS",
+            "Canceled open orders before EOD closeout")
+    except Exception as e:
+        print(f"Cancel orders error: {e}")
+        log_event("ACCOUNT", "CANCEL_ERROR", str(e))
+
+    import time as sleep_time
+    sleep_time.sleep(5)
+
+    for position in positions:
+        try:
+            trading_client.close_position(position.symbol)
+            print(f"{position.symbol}: CLOSE ORDER SENT before market close")
+            log_event(
+                position.symbol,
+                "CLOSE_SENT_EOD",
+                "Close order sent before market close")
+        except Exception as e:
+            print(f"{position.symbol}: CLOSE ERROR - {e}")
+            log_event(position.symbol, "CLOSE_ERROR", str(e))
+
+    return True, "End-of-day closeout attempted"
+
+
+def trades_today_by_model(model_name):
+    if not os.path.isfile(LOG_FILE):
+        return 0
+
+    df = pd.read_csv(LOG_FILE)
+
+    today = datetime.now(ZoneInfo("America/New_York")).date()
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    df_today = df[df["timestamp"].dt.date == today]
+
+    return len(df_today[(df_today["decision"] == "TRADE_PLACED") & (
+        df_today["model"] == model_name)])
+
+
+def run_bot():
+    print("Starting Alpaca paper trading bot...")
+    print_account_status()
+
+    close_done, close_reason = close_positions_near_market_close()
+
+    if close_done:
+        print(close_reason)
+        return
+
+    if not PAPER_TRADING:
+        raise RuntimeError("Live trading is disabled. Paper trading only.")
+
+    if not market_is_open():
+        print("Market is closed")
+        return
+
+    time_ok, time_reason = trading_time_window_check()
+
+    if not time_ok:
+        print(time_reason)
+        log_event("TIME", "TIME_BLOCKED", time_reason)
+        return
+
+    print(time_reason)
+
+    loss_ok, loss_reason = daily_loss_check()
+
+    if not loss_ok:
+        print(loss_reason)
+        log_event("ACCOUNT", "DAILY_LOSS_BLOCKED", loss_reason)
+        return
+
+    print(loss_reason)
+
+    market_ok, market_reason = spy_market_filter()
+
+    if not market_ok:
+        print(f"Market filter blocked trading: {market_reason}")
+        log_event("SPY", "MARKET_BLOCKED", market_reason)
+        return
+
+    print(f"Market filter passed: {market_reason}")
+
+    trades_today = trades_placed_today()
+
+    if trades_today >= MAX_TRADES_PER_DAY:
+        reason = f"Max trades per day reached: {trades_today}/{MAX_TRADES_PER_DAY}"
+        print(reason)
+        log_event("ACCOUNT", "MAX_TRADES_BLOCKED", reason)
+        return
+
+    print(f"Trades placed today: {trades_today}/{MAX_TRADES_PER_DAY}")
+
+    symbols_to_check = build_auto_watchlist() if USE_AUTO_SCANNER else MANUAL_WATCHLIST
+
+    if not symbols_to_check:
+        print("No symbols passed scanner.")
+        return
+
+    for symbol in symbols_to_check:
+        in_position, position_reason = already_in_position(symbol)
+
+        if in_position:
+            print(f"{symbol}: BLOCKED - {position_reason}")
+            log_event(symbol, "BLOCKED", position_reason)
+            continue
+
+        signal = None
+        reason = ""
+
+        # Breakout first
+        if ENABLE_BREAKOUT:
+            signal, reason = breakout_signal(symbol)
+            if signal is not None:
+                signal["model"] = "breakout"
+
+        # Pullback second
+        if signal is None and ENABLE_PULLBACK:
+            pb_signal, pb_reason = pullback_signal(symbol)
+            if pb_signal is not None:
+                signal = pb_signal
+                signal["model"] = "pullback"
+            else:
+                reason = pb_reason
+
+        if signal is None:
+            print(f"{symbol}: SKIPPED - {reason}")
+            log_event(symbol, "SKIPPED", reason)
+            continue
+
+        # Risk check
+        approved, risk_reason, qty = risk_check(signal)
+
+        if not approved:
+            print(f"{symbol}: BLOCKED - {risk_reason}")
+            log_event(symbol, "BLOCKED", risk_reason)
+            continue
+
+        try:
+            place_trade(signal, qty)
+            print(f"{symbol}: TRADE PLACED qty={qty}")
+
+            log_event(
+                symbol,
+                "TRADE_PLACED",
+                f"{signal.get('model', 'unknown')} trade",
+                signal["entry"],
+                signal["stop"],
+                signal["target"],
+                qty,
+                signal.get("model", "unknown")
+            )
+
+        except Exception as e:
+            print(f"{symbol}: ERROR - {e}")
+            log_event(symbol, "ERROR", str(e))
+
+
+
+if __name__ == "__main__":
+    while True:
+        if market_is_open():
+            print("Market is open — running bot\n")
+            run_bot()
+            sleep_time.sleep(300)
+        else:
+            print("Market is closed — sleeping 10 minutes\n")
+            sleep_time.sleep(600)
