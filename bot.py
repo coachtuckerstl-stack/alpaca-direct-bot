@@ -85,7 +85,14 @@ import json
 from sqlalchemy import create_engine, text
 
 DATABASE_URL = os.getenv("DATABASE_URL")
-db_engine = create_engine(DATABASE_URL) if DATABASE_URL else None
+db_engine = None
+
+if DATABASE_URL:
+    try:
+        db_engine = create_engine(DATABASE_URL)
+    except Exception as e:
+        print(f"Database engine setup failed: {e}", flush=True)
+        db_engine = None
 
 print(f"DATABASE_URL loaded: {'YES' if DATABASE_URL else 'NO'}", flush=True)
 print(f"Database engine ready: {'YES' if db_engine else 'NO'}", flush=True)
