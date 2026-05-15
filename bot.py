@@ -77,6 +77,100 @@ LOG_FILE = "trade_log.csv"
 trading_client = TradingClient(API_KEY, SECRET_KEY, paper=PAPER_TRADING)
 data_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
 
+# ==============================
+# Dashboard Database Logging
+# ==============================
+
+import json
+from sqlalchemy import create_engine, text
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+db_engine = create_engine(DATABASE_URL) if DATABASE_URL else None
+
+print(f"DATABASE_URL loaded: {'YES' if DATABASE_URL else 'NO'}", flush=True)
+print(f"Database engine ready: {'YES' if db_engine else 'NO'}", flush=True)
+
+
+def log_db_event(
+    event_type,
+    symbol=None,
+    side=None,
+    strategy=None,
+    model=None,
+    status=None,
+    qty=None,
+    entry=None,
+    stop_loss=None,
+    take_profit=None,
+    order_id=None,
+    message=None,
+    raw_payload=None,
+):
+    if db_engine is None:
+        print("Database log skipped: db_engine is None", flush=True)
+        return
+
+    try:
+        payload_text = None
+        if raw_payload is not None:
+            payload_text = json.dumps(raw_payload)
+
+        with db_engine.begin() as conn:
+            conn.execute(
+                text("""
+                    INSERT INTO bot_events (
+                        bot_name,
+                        event_type,
+                        symbol,
+                        side,
+                        strategy,
+                        model,
+                        status,
+                        qty,
+                        entry,
+                        stop_loss,
+                        take_profit,
+                        order_id,
+                        message,
+                        raw_payload
+                    )
+                    VALUES (
+                        :bot_name,
+                        :event_type,
+                        :symbol,
+                        :side,
+                        :strategy,
+                        :model,
+                        :status,
+                        :qty,
+                        :entry,
+                        :stop_loss,
+                        :take_profit,
+                        :order_id,
+                        :message,
+                        :raw_payload
+                    )
+                """),
+                {
+                    "bot_name": "Alpaca Direct Bot - Auto Scanner",
+                    "event_type": event_type,
+                    "symbol": symbol,
+                    "side": side,
+                    "strategy": strategy,
+                    "model": model,
+                    "status": status,
+                    "qty": qty,
+                    "entry": entry,
+                    "stop_loss": stop_loss,
+                    "take_profit": take_profit,
+                    "order_id": order_id,
+                    "message": message,
+                    "raw_payload": payload_text,
+                },
+            )
+    except Exception as e:
+        print(f"Database log failed: {e}", flush=True)
+
 
 def log_event(
     symbol,
@@ -738,13 +832,52 @@ def run_bot():
             log_event(symbol, "ERROR", str(e))
 
 
-
 if __name__ == "__main__":
+    log_db_event(
+        event_type="BOT_STARTED",
+        status="STARTED",
+        message="Alpaca Direct Bot started on Railway/local runtime",
+    )
+
     while True:
-        if market_is_open():
-            print("Market is open — running bot\n")
-            run_bot()
+        try:
+            if market_is_open():
+                print("Market is open — running bot\n")
+
+                log_db_event(
+                    event_type="HEARTBEAT",
+                    status="MARKET_OPEN",
+                    message="Market is open — running Alpaca Direct scanner",
+                )
+
+                run_bot()
+
+                log_db_event(
+                    event_type="SCAN_COMPLETE",
+                    status="COMPLETE",
+                    message="Alpaca Direct scanner cycle completed",
+                )
+
+                sleep_time.sleep(300)
+
+            else:
+                print("Market is closed — sleeping 10 minutes\n")
+
+                log_db_event(
+                    event_type="HEARTBEAT",
+                    status="MARKET_CLOSED",
+                    message="Market is closed — sleeping 10 minutes",
+                )
+
+                sleep_time.sleep(600)
+
+        except Exception as e:
+            print(f"MAIN LOOP ERROR - {e}")
+
+            log_db_event(
+                event_type="ERROR",
+                status="ERROR",
+                message=f"Main loop error: {e}",
+            )
+
             sleep_time.sleep(300)
-        else:
-            print("Market is closed — sleeping 10 minutes\n")
-            sleep_time.sleep(600)
