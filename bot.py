@@ -14,6 +14,7 @@ from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass, AssetStatus
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
+from trade_logger import log_trade_event
 
 
 load_dotenv()
@@ -480,7 +481,8 @@ def breakout_signal(symbol):
         "stop": stop,
         "target": target,
         "risk_per_share": risk_per_share,
-        "model": "breakout"
+        "strategy": "breakout_momentum_v1",
+        "model": "direct_breakout_live_v1"
     }, "Valid tightened breakout"
 
 
@@ -524,8 +526,7 @@ def pullback_signal(symbol):
     if sma_20 < sma_50:
         return None, "Trend not strong enough"
 
-    pullback_depth = (two_days_ago_close - yesterday_close) / \
-    two_days_ago_close
+    pullback_depth = (two_days_ago_close - yesterday_close) / two_days_ago_close
 
     if pullback_depth <= 0:
         return None, "No pullback"
@@ -544,8 +545,6 @@ def pullback_signal(symbol):
 
     entry = round(close, 2)
     stop = round(entry - 1.50, 2)
-    target = round(entry + 3.00, 2)
-
     risk_per_share = entry - stop
 
     if risk_per_share <= 0:
@@ -559,7 +558,8 @@ def pullback_signal(symbol):
         "stop": stop,
         "target": target,
         "risk_per_share": risk_per_share,
-        "model": "pullback"
+        "strategy": "pullback_reclaim_v1",
+        "model": "direct_pullback_live_v1"
     }, "Valid tightened pullback"
 
 
@@ -601,7 +601,24 @@ def place_trade(signal, qty):
             trail_percent=TRAILING_STOP_PERCENT
         )
 
-        return trading_client.submit_order(order)
+        submitted_order = trading_client.submit_order(order)
+
+        log_trade_event(
+            bot_group="DIRECT_SCANNER",
+            strategy=signal.get("strategy", "unknown_strategy"),
+            model=signal.get("model", "direct_scanner_live_v1"),
+            symbol=signal["symbol"],
+            side="buy",
+            qty=qty,
+            entry_price=signal.get("entry", ""),
+            stop_loss="",
+            take_profit="",
+            status="ORDER_SUBMITTED",
+            order_id=getattr(submitted_order, "id", ""),
+            raw_payload=signal,
+        )
+
+        return submitted_order
 
     order = MarketOrderRequest(
         symbol=signal["symbol"],
@@ -613,7 +630,24 @@ def place_trade(signal, qty):
         stop_loss=StopLossRequest(stop_price=signal["stop"])
     )
 
-    return trading_client.submit_order(order)
+    submitted_order = trading_client.submit_order(order)
+
+    log_trade_event(
+        bot_group="DIRECT_SCANNER",
+        strategy=signal.get("strategy", "unknown_strategy"),
+        model=signal.get("model", "direct_scanner_live_v1"),
+        symbol=signal["symbol"],
+        side="buy",
+        qty=qty,
+        entry_price=signal.get("entry", ""),
+        stop_loss=signal.get("stop", ""),
+        take_profit=signal.get("target", ""),
+        status="ORDER_SUBMITTED",
+        order_id=getattr(submitted_order, "id", ""),
+        raw_payload=signal,
+    )
+
+    return submitted_order
 
 
 def trades_placed_today():
