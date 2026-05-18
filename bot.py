@@ -221,17 +221,11 @@ def market_is_open():
 def trading_time_window_check():
     now = datetime.now(ZoneInfo("America/New_York")).time()
 
-    morning_start = time(9, 45)
-    morning_end = time(11, 30)
+    trading_start = time(9, 45)
+    trading_end = time(15, 30)
 
-    afternoon_start = time(14, 0)
-    afternoon_end = time(15, 30)
-
-    if morning_start <= now <= morning_end:
-        return True, "Morning trading window approved"
-
-    if afternoon_start <= now <= afternoon_end:
-        return True, "Afternoon trading window approved"
+    if trading_start <= now <= trading_end:
+        return True, "Trading window approved"
 
     return False, "Outside approved trading time window"
 
@@ -829,14 +823,14 @@ def run_bot():
         if ENABLE_BREAKOUT:
             signal, reason = breakout_signal(symbol)
             if signal is not None:
-                signal["model"] = "breakout"
+                signal["model"] = signal.get("model", "direct_breakout_live_v1")
 
         # Pullback second
         if signal is None and ENABLE_PULLBACK:
             pb_signal, pb_reason = pullback_signal(symbol)
             if pb_signal is not None:
                 signal = pb_signal
-                signal["model"] = "pullback"
+                signal["model"] = signal.get("model", "direct_pullback_live_v1")
             else:
                 reason = pb_reason
 
