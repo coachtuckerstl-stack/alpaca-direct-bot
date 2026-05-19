@@ -460,7 +460,7 @@ def breakout_signal(symbol):
     if current_price <= prior_high:
         return None, "No breakout"
 
-        entry = round(current_price, 2)
+    entry = round(current_price, 2)
     stop = round(entry - 1.50, 2)
     target = round(entry + 3.00, 2)
 
