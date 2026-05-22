@@ -556,6 +556,17 @@ def pullback_signal(symbol):
         "model": "direct_pullback_live_v1"
     }, "Valid tightened pullback"
 
+def asset_supports_fractional_trading(symbol):
+    """
+    Return True when Alpaca marks this equity as eligible for fractional trading.
+    """
+    try:
+        asset = trading_client.get_asset(symbol)
+        return bool(getattr(asset, "fractionable", False))
+    except Exception as e:
+        print(f"{symbol}: FRACTIONABLE CHECK ERROR - {e}", flush=True)
+        return False
+
 
 def risk_check(signal):
     equity = get_account_equity()
@@ -564,23 +575,35 @@ def risk_check(signal):
     if open_positions >= MAX_OPEN_TRADES:
         return False, "Too many open trades", 0
 
-    qty = calculate_position_size(equity, signal["risk_per_share"])
+    entry_price = float(signal["entry"])
+    risk_qty = float(calculate_position_size(equity, signal["risk_per_share"]))
 
-    if qty < 1:
+    if risk_qty <= 0:
         return False, "Position size too small", 0
 
-    # limit by account equity
-    if qty * signal["entry"] > equity:
-        qty = int(equity / signal["entry"])
+    equity_qty = equity / entry_price
+    max_dollar_qty = MAX_DOLLARS_PER_TRADE / entry_price
 
-    # limit by max dollars per trade
-    if qty * signal["entry"] > MAX_DOLLARS_PER_TRADE:
-        qty = int(MAX_DOLLARS_PER_TRADE / signal["entry"])
+    # Keep the trade within risk sizing, available equity, and the $20 test budget.
+    qty = round(min(risk_qty, equity_qty, max_dollar_qty), 6)
 
-    if qty < 1:
-        return False, "Trade exceeds max dollar limit", 0
+    if qty <= 0:
+        return False, "Position size too small after dollar cap", 0
 
-    return True, "Risk approved", qty
+    requires_fractional = abs(qty - round(qty)) > 0.000001
+
+    if requires_fractional and not asset_supports_fractional_trading(signal["symbol"]):
+        return False, (
+            f"Fractional shares unavailable; entry ${entry_price:.2f} "
+            f"cannot fit ${MAX_DOLLARS_PER_TRADE:.2f} trade limit"
+        ), 0
+
+    estimated_trade_value = round(qty * entry_price, 2)
+
+    return True, (
+        f"Risk approved - qty={qty}, estimated value=${estimated_trade_value:.2f}, "
+        f"max=${MAX_DOLLARS_PER_TRADE:.2f}"
+    ), qty
 
 
 def place_trade(signal, qty):
@@ -849,7 +872,8 @@ def run_bot():
 
         try:
             place_trade(signal, qty)
-            print(f"{symbol}: TRADE PLACED qty={qty}")
+            estimated_value = round(qty * signal["entry"], 2)
+            print(f"{symbol}: TRADE PLACED qty={qty} estimated_value=${estimated_value:.2f}")
 
             log_event(
                 symbol,
