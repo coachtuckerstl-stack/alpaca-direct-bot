@@ -606,7 +606,24 @@ def risk_check(signal):
     ), qty
 
 
+
+def build_client_order_id(signal):
+    """
+    Add a short strategy tag to every new Alpaca entry order so the Coach T
+    dashboard can separate Strategies 1 and 2 even though they share an account.
+    """
+    strategy_codes = {
+        "breakout_momentum_v1": "s1_breakout",
+        "pullback_reclaim_v1": "s2_pullback",
+    }
+    strategy_code = strategy_codes.get(signal.get("strategy", ""), "scanner")
+    symbol = "".join(ch for ch in str(signal.get("symbol", "NA")).upper() if ch.isalnum())
+    stamp = datetime.now(ZoneInfo("America/New_York")).strftime("%y%m%d%H%M%S%f")
+    return f"ct_{strategy_code}_{symbol}_{stamp}"
+
 def place_trade(signal, qty):
+    client_order_id = build_client_order_id(signal)
+
     if USE_TRAILING_STOP:
         from alpaca.trading.requests import TrailingStopOrderRequest
 
@@ -615,7 +632,8 @@ def place_trade(signal, qty):
             qty=qty,
             side=OrderSide.BUY,
             time_in_force=TimeInForce.DAY,
-            trail_percent=TRAILING_STOP_PERCENT
+            trail_percent=TRAILING_STOP_PERCENT,
+            client_order_id=client_order_id
         )
 
         submitted_order = trading_client.submit_order(order)
@@ -632,7 +650,7 @@ def place_trade(signal, qty):
             take_profit="",
             status="ORDER_SUBMITTED",
             order_id=getattr(submitted_order, "id", ""),
-            raw_payload=signal,
+            raw_payload={**signal, "client_order_id": client_order_id},
         )
 
         return submitted_order
@@ -642,6 +660,7 @@ def place_trade(signal, qty):
         qty=qty,
         side=OrderSide.BUY,
         time_in_force=TimeInForce.DAY,
+        client_order_id=client_order_id,
         order_class=OrderClass.BRACKET,
         take_profit=TakeProfitRequest(limit_price=signal["target"]),
         stop_loss=StopLossRequest(stop_price=signal["stop"])
@@ -661,7 +680,7 @@ def place_trade(signal, qty):
         take_profit=signal.get("target", ""),
         status="ORDER_SUBMITTED",
         order_id=getattr(submitted_order, "id", ""),
-        raw_payload=signal,
+        raw_payload={**signal, "client_order_id": client_order_id},
     )
 
     return submitted_order
