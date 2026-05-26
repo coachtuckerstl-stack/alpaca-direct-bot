@@ -25,8 +25,18 @@ SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 PAPER_TRADING = True
 
 USE_AUTO_SCANNER = True
-MAX_SYMBOLS_TO_SCAN = 500
-MAX_CANDIDATES_TO_TRADE = 10
+MAX_SYMBOLS_TO_SCAN = int(os.getenv("MAX_SYMBOLS_TO_SCAN", "500"))
+MAX_CANDIDATES_TO_TRADE = int(os.getenv("MAX_CANDIDATES_TO_TRADE", "10"))
+SCANNER_BATCH_SIZE = int(os.getenv("SCANNER_BATCH_SIZE", "100"))
+
+# Liquid symbols are scanned first; the remaining tradable universe is still
+# included up to MAX_SYMBOLS_TO_SCAN. This avoids spending an hour before the
+# bot reaches symbols it actually trades most often.
+PREFERRED_SCANNER_SYMBOLS = [
+    "SPY", "QQQ", "IWM", "AAPL", "MSFT", "NVDA", "AMD", "TSLA",
+    "META", "AMZN", "GOOGL", "NFLX", "PLTR", "COIN", "SOFI",
+    "SMCI", "AVGO", "MU", "INTC", "ARM", "RIVN", "HOOD"
+]
 
 MANUAL_WATCHLIST = [
     "AAPL",
@@ -314,17 +324,6 @@ def already_in_position(symbol):
     except Exception as e:
         return True, f"Position check error: {e}"
 
-    preferred = [
-        "AAPL", "MSFT", "NVDA", "AMD", "TSLA", "META", "AMZN", "GOOGL",
-        "NFLX", "PLTR", "COIN", "SOFI", "RIVN", "SMCI", "AVGO",
-        "QQQ", "SPY", "IWM"
-    ]
-
-    final_symbols = preferred + [s for s in symbols if s not in preferred]
-
-    return final_symbols[:MAX_SYMBOLS_TO_SCAN]
-
-
 def get_tradable_symbols():
     assets = trading_client.get_all_assets()
     symbols = []
@@ -349,13 +348,47 @@ def get_tradable_symbols():
 
         symbols.append(asset.symbol)
 
-    return symbols
+    available = set(symbols)
+    preferred = [s for s in PREFERRED_SCANNER_SYMBOLS if s in available]
+    remaining = sorted(s for s in symbols if s not in preferred)
+    return (preferred + remaining)[:MAX_SYMBOLS_TO_SCAN]
 
 
-def scan_stock(symbol):
-    bars = get_daily_bars(symbol)
+def get_daily_bars_batch(symbols, days=60):
+    """Retrieve daily candles in batches instead of one API request per symbol."""
+    if not symbols:
+        return {}
 
-    if len(bars) < 25:
+    end = datetime.now(ZoneInfo("America/New_York"))
+    start = end - timedelta(days=days)
+    results = {}
+
+    for offset in range(0, len(symbols), SCANNER_BATCH_SIZE):
+        batch = symbols[offset:offset + SCANNER_BATCH_SIZE]
+        request = StockBarsRequest(
+            symbol_or_symbols=batch,
+            timeframe=TimeFrame.Day,
+            start=start,
+            end=end,
+            feed="iex"
+        )
+        bars = data_client.get_stock_bars(request).df
+        if bars.empty:
+            continue
+
+        for symbol in batch:
+            try:
+                symbol_bars = bars.xs(symbol) if isinstance(bars.index, pd.MultiIndex) else bars
+            except KeyError:
+                continue
+            if not symbol_bars.empty:
+                results[symbol] = symbol_bars
+
+    return results
+
+
+def scan_stock_from_bars(symbol, bars):
+    if bars is None or len(bars) < 25:
         return None
 
     today = bars.iloc[-1]
@@ -374,7 +407,6 @@ def scan_stock(symbol):
 
     percent_change = (close - prior_close) / prior_close
     relative_volume = volume / avg_volume if avg_volume > 0 else 0
-
     score = (percent_change * 100) + relative_volume
 
     return {
@@ -387,27 +419,59 @@ def scan_stock(symbol):
 
 
 def build_auto_watchlist():
-    print("Building auto watchlist...")
+    started = sleep_time.perf_counter()
+    print("Building auto watchlist...", flush=True)
 
     symbols = get_tradable_symbols()
     candidates = []
+    scan_errors = 0
+
+    try:
+        all_bars = get_daily_bars_batch(symbols)
+    except Exception as e:
+        elapsed = round(sleep_time.perf_counter() - started, 2)
+        message = f"Auto watchlist batch download failed after {elapsed}s: {e}"
+        print(message, flush=True)
+        log_db_event(
+            event_type="SCAN_ERROR", status="ERROR", message=message,
+            raw_payload={"symbols_requested": len(symbols), "seconds": elapsed}
+        )
+        return []
 
     for symbol in symbols:
         try:
-            result = scan_stock(symbol)
-
+            result = scan_stock_from_bars(symbol, all_bars.get(symbol))
             if result:
                 candidates.append(result)
-
         except Exception as e:
+            scan_errors += 1
             log_event(symbol, "SCAN_ERROR", str(e))
 
     candidates = sorted(candidates, key=lambda x: x["score"], reverse=True)
+    selected = [item["symbol"] for item in candidates[:MAX_CANDIDATES_TO_TRADE]]
+    elapsed = round(sleep_time.perf_counter() - started, 2)
 
-    selected = [item["symbol"]
-                for item in candidates[:MAX_CANDIDATES_TO_TRADE]]
-
-    print(f"Auto watchlist selected: {selected}")
+    summary = {
+        "symbols_scanned": len(symbols),
+        "symbols_with_bars": len(all_bars),
+        "candidates_found": len(candidates),
+        "selected_symbols": selected,
+        "scan_errors": scan_errors,
+        "runtime_seconds": elapsed,
+    }
+    print(
+        f"Auto watchlist selected: {selected} | scanned={len(symbols)} "
+        f"candidates={len(candidates)} runtime={elapsed}s errors={scan_errors}",
+        flush=True,
+    )
+    log_db_event(
+        event_type="WATCHLIST_COMPLETE", status="COMPLETE",
+        message=(
+            f"Scanner checked {len(symbols)} symbols in {elapsed}s; "
+            f"selected {len(selected)} candidates"
+        ),
+        raw_payload=summary,
+    )
 
     for item in candidates[:MAX_CANDIDATES_TO_TRADE]:
         log_event(
@@ -556,18 +620,6 @@ def pullback_signal(symbol):
         "model": "direct_pullback_live_v1"
     }, "Valid tightened pullback"
 
-def asset_supports_fractional_trading(symbol):
-    """
-    Return True when Alpaca marks this equity as eligible for fractional trading.
-    """
-    try:
-        asset = trading_client.get_asset(symbol)
-        return bool(getattr(asset, "fractionable", False))
-    except Exception as e:
-        print(f"{symbol}: FRACTIONABLE CHECK ERROR - {e}", flush=True)
-        return False
-
-
 def risk_check(signal):
     equity = get_account_equity()
     open_positions = get_open_positions_count()
@@ -576,32 +628,30 @@ def risk_check(signal):
         return False, "Too many open trades", 0
 
     entry_price = float(signal["entry"])
-    risk_qty = float(calculate_position_size(equity, signal["risk_per_share"]))
+    risk_qty = int(calculate_position_size(equity, signal["risk_per_share"]))
 
     if risk_qty <= 0:
         return False, "Position size too small", 0
 
-    equity_qty = equity / entry_price
-    max_dollar_qty = MAX_DOLLARS_PER_TRADE / entry_price
+    equity_qty = int(equity / entry_price)
+    max_dollar_qty = int(MAX_DOLLARS_PER_TRADE / entry_price)
 
-    # Keep the trade within risk sizing, available equity, and the $20 test budget.
-    qty = round(min(risk_qty, equity_qty, max_dollar_qty), 6)
+    # Strategies 1/2 use protected exit orders (bracket or trailing stop).
+    # Alpaca rejects fractional protected/bracket entries, so these strategies
+    # intentionally submit whole-share quantities only.
+    qty = min(risk_qty, equity_qty, max_dollar_qty)
 
-    if qty <= 0:
-        return False, "Position size too small after dollar cap", 0
-
-    requires_fractional = abs(qty - round(qty)) > 0.000001
-
-    if requires_fractional and not asset_supports_fractional_trading(signal["symbol"]):
+    if qty < 1:
         return False, (
-            f"Fractional shares unavailable; entry ${entry_price:.2f} "
-            f"cannot fit ${MAX_DOLLARS_PER_TRADE:.2f} trade limit"
+            f"Protected order requires at least 1 whole share; entry ${entry_price:.2f} "
+            f"does not fit ${MAX_DOLLARS_PER_TRADE:.2f} trade cap"
         ), 0
 
     estimated_trade_value = round(qty * entry_price, 2)
 
     return True, (
-        f"Risk approved - qty={qty}, estimated value=${estimated_trade_value:.2f}, "
+        f"Risk approved - protected whole-share qty={qty}, "
+        f"estimated value=${estimated_trade_value:.2f}, "
         f"max=${MAX_DOLLARS_PER_TRADE:.2f}"
     ), qty
 
@@ -850,10 +900,21 @@ def run_bot():
         print("No symbols passed scanner.")
         return
 
+    cycle_stats = {
+        "symbols_selected": len(symbols_to_check),
+        "signals_found": 0,
+        "orders_attempted": 0,
+        "orders_submitted": 0,
+        "orders_rejected": 0,
+        "skipped": 0,
+        "blocked": 0,
+    }
+
     for symbol in symbols_to_check:
         in_position, position_reason = already_in_position(symbol)
 
         if in_position:
+            cycle_stats["blocked"] += 1
             print(f"{symbol}: BLOCKED - {position_reason}")
             log_event(symbol, "BLOCKED", position_reason)
             continue
@@ -877,20 +938,31 @@ def run_bot():
                 reason = pb_reason
 
         if signal is None:
+            cycle_stats["skipped"] += 1
             print(f"{symbol}: SKIPPED - {reason}")
             log_event(symbol, "SKIPPED", reason)
             continue
+
+        cycle_stats["signals_found"] += 1
 
         # Risk check
         approved, risk_reason, qty = risk_check(signal)
 
         if not approved:
+            cycle_stats["blocked"] += 1
             print(f"{symbol}: BLOCKED - {risk_reason}")
             log_event(symbol, "BLOCKED", risk_reason)
+            log_db_event(
+                event_type="SIGNAL_BLOCKED", symbol=symbol,
+                strategy=signal.get("strategy"), model=signal.get("model"),
+                status="BLOCKED", message=risk_reason, raw_payload=signal
+            )
             continue
 
+        cycle_stats["orders_attempted"] += 1
         try:
-            place_trade(signal, qty)
+            submitted_order = place_trade(signal, qty)
+            cycle_stats["orders_submitted"] += 1
             estimated_value = round(qty * signal["entry"], 2)
             print(f"{symbol}: TRADE PLACED qty={qty} estimated_value=${estimated_value:.2f}")
 
@@ -904,10 +976,41 @@ def run_bot():
                 qty,
                 signal.get("model", "unknown")
             )
+            log_db_event(
+                event_type="ORDER_SUBMITTED", symbol=symbol, side="buy",
+                strategy=signal.get("strategy"), model=signal.get("model"),
+                status="SUBMITTED", qty=qty, entry=signal.get("entry"),
+                stop_loss=signal.get("stop"), take_profit=signal.get("target"),
+                order_id=str(getattr(submitted_order, "id", "")),
+                message=f"Protected paper order submitted: qty={qty}",
+                raw_payload=signal
+            )
 
         except Exception as e:
+            cycle_stats["orders_rejected"] += 1
             print(f"{symbol}: ERROR - {e}")
             log_event(symbol, "ERROR", str(e))
+            log_db_event(
+                event_type="ORDER_REJECTED", symbol=symbol, side="buy",
+                strategy=signal.get("strategy"), model=signal.get("model"),
+                status="ERROR", qty=qty, entry=signal.get("entry"),
+                stop_loss=signal.get("stop"), take_profit=signal.get("target"),
+                message=str(e), raw_payload=signal
+            )
+
+    diagnostic_message = (
+        f"Candidates={cycle_stats['symbols_selected']}; "
+        f"signals={cycle_stats['signals_found']}; "
+        f"attempted={cycle_stats['orders_attempted']}; "
+        f"submitted={cycle_stats['orders_submitted']}; "
+        f"rejected={cycle_stats['orders_rejected']}; "
+        f"blocked={cycle_stats['blocked']}; skipped={cycle_stats['skipped']}"
+    )
+    print(f"Cycle diagnostics: {diagnostic_message}", flush=True)
+    log_db_event(
+        event_type="CYCLE_DIAGNOSTICS", status="COMPLETE",
+        message=diagnostic_message, raw_payload=cycle_stats
+    )
 
 
 if __name__ == "__main__":
