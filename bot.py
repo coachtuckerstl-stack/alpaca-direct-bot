@@ -737,26 +737,28 @@ def place_trade(signal, qty):
 
 
 def trades_placed_today():
-    if not os.path.isfile(LOG_FILE):
+    # Count from the bot_events Postgres table rather than the local CSV,
+    # which is wiped whenever Railway restarts the container.
+    if db_engine is None:
+        print("trades_placed_today: db_engine is None, returning 0", flush=True)
         return 0
 
-    today = datetime.now().date()
-    count = 0
-
-    with open(LOG_FILE, mode="r", newline="") as file:
-        reader = csv.DictReader(file)
-
-        for row in reader:
-            try:
-                row_date = datetime.fromisoformat(row["timestamp"]).date()
-
-                if row_date == today and row["decision"] == "TRADE_PLACED":
-                    count += 1
-
-            except Exception:
-                continue
-
-    return count
+    try:
+        with db_engine.connect() as conn:
+            result = conn.execute(
+                text("""
+                    SELECT COUNT(*)
+                    FROM bot_events
+                    WHERE date(created_at) = current_date
+                      AND status = 'ACCEPTED'
+                      AND bot_name = :bot_name
+                """),
+                {"bot_name": "Alpaca Direct Bot - Auto Scanner"},
+            )
+            return result.scalar() or 0
+    except Exception as e:
+        print(f"trades_placed_today query failed: {e}", flush=True)
+        return 0
 
 
 def print_account_status():
@@ -977,9 +979,9 @@ def run_bot():
                 signal.get("model", "unknown")
             )
             log_db_event(
-                event_type="ORDER_SUBMITTED", symbol=symbol, side="buy",
+                event_type="TRADE_PLACED", symbol=symbol, side="buy",
                 strategy=signal.get("strategy"), model=signal.get("model"),
-                status="SUBMITTED", qty=qty, entry=signal.get("entry"),
+                status="ACCEPTED", qty=qty, entry=signal.get("entry"),
                 stop_loss=signal.get("stop"), take_profit=signal.get("target"),
                 order_id=str(getattr(submitted_order, "id", "")),
                 message=f"Protected paper order submitted: qty={qty}",
