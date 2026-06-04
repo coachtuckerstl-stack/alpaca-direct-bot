@@ -100,7 +100,11 @@ db_engine = None
 
 if DATABASE_URL:
     try:
-        db_engine = create_engine(DATABASE_URL)
+        # pool_pre_ping checks out each pooled connection before use, so a
+        # connection the Postgres server already closed (seen as
+        # "SSL SYSCALL error: EOF detected") is transparently replaced
+        # instead of failing the query.
+        db_engine = create_engine(DATABASE_URL, pool_pre_ping=True)
     except Exception as e:
         print(f"Database engine setup failed: {e}", flush=True)
         db_engine = None
