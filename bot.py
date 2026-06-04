@@ -979,12 +979,25 @@ def run_bot():
                 signal.get("model", "unknown")
             )
             log_db_event(
+                event_type="ORDER_SUBMITTED", symbol=symbol, side="buy",
+                strategy=signal.get("strategy"), model=signal.get("model"),
+                status="SUBMITTED", qty=qty, entry=signal.get("entry"),
+                stop_loss=signal.get("stop"), take_profit=signal.get("target"),
+                order_id=str(getattr(submitted_order, "id", "")),
+                message=f"Protected paper order submitted: qty={qty}",
+                raw_payload=signal
+            )
+            # Separate ACCEPTED event so trades_placed_today() can count from
+            # bot_events consistently with the alligator/tradingview bots,
+            # while leaving the ORDER_SUBMITTED/SUBMITTED row that the
+            # dashboards (e.g. trading-dashboard /api/positions) depend on.
+            log_db_event(
                 event_type="TRADE_PLACED", symbol=symbol, side="buy",
                 strategy=signal.get("strategy"), model=signal.get("model"),
                 status="ACCEPTED", qty=qty, entry=signal.get("entry"),
                 stop_loss=signal.get("stop"), take_profit=signal.get("target"),
                 order_id=str(getattr(submitted_order, "id", "")),
-                message=f"Protected paper order submitted: qty={qty}",
+                message=f"Protected paper order accepted: qty={qty}",
                 raw_payload=signal
             )
 
