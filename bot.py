@@ -62,7 +62,7 @@ MAX_RISK_PER_TRADE_PULLBACK = 0.005
 MIN_STOCK_PRICE = 10
 MAX_STOCK_PRICE = 750
 MIN_AVG_VOLUME = 250_000
-MAX_DOLLARS_PER_TRADE = float(os.getenv("MAX_DOLLARS_PER_TRADE", "100"))
+MAX_DOLLARS_PER_TRADE = float(os.getenv("MAX_DOLLARS_PER_TRADE", "20"))
 MIN_RELATIVE_VOLUME = 1.2
 MIN_DAILY_GAIN_PERCENT = 0.005
 MIN_DOLLAR_VOLUME = 50_000_000
@@ -548,6 +548,17 @@ def breakout_signal(symbol):
     }, "Valid tightened breakout"
 
 
+
+def calculate_fractional_qty(entry_price):
+    """Return fractional share qty for fixed $20 notional paper testing."""
+    try:
+        entry_price = float(entry_price)
+        if entry_price <= 0:
+            return 0
+        return round(MAX_DOLLARS_PER_TRADE / entry_price, 6)
+    except Exception:
+        return 0
+
 def calculate_position_size(account_equity, risk_per_share):
     max_risk = account_equity * MAX_RISK_PER_TRADE
     qty = int(max_risk / risk_per_share)
@@ -632,34 +643,18 @@ def risk_check(signal):
         return False, "Too many open trades", 0
 
     entry_price = float(signal["entry"])
-    risk_qty = int(calculate_position_size(equity, signal["risk_per_share"]))
+    qty = calculate_fractional_qty(entry_price)
 
-    if risk_qty <= 0:
-        return False, "Position size too small", 0
-
-    equity_qty = int(equity / entry_price)
-    max_dollar_qty = int(MAX_DOLLARS_PER_TRADE / entry_price)
-
-    # Strategies 1/2 use protected exit orders (bracket or trailing stop).
-    # Alpaca rejects fractional protected/bracket entries, so these strategies
-    # intentionally submit whole-share quantities only.
-    qty = min(risk_qty, equity_qty, max_dollar_qty)
-
-    if qty < 1:
-        return False, (
-            f"Protected order requires at least 1 whole share; entry ${entry_price:.2f} "
-            f"does not fit ${MAX_DOLLARS_PER_TRADE:.2f} trade cap"
-        ), 0
+    if qty <= 0:
+        return False, f"Fractional qty could not be calculated for entry ${entry_price:.2f}", 0
 
     estimated_trade_value = round(qty * entry_price, 2)
 
-    return True, (
-        f"Risk approved - protected whole-share qty={qty}, "
-        f"estimated value=${estimated_trade_value:.2f}, "
-        f"max=${MAX_DOLLARS_PER_TRADE:.2f}"
-    ), qty
-
-
+    return (
+        True,
+        f"Risk approved - fractional $20 notional qty={qty}, estimated value=${estimated_trade_value:.2f}, max=${MAX_DOLLARS_PER_TRADE:.2f}",
+        qty
+    )
 
 def build_client_order_id(signal):
     """
