@@ -671,48 +671,19 @@ def build_client_order_id(signal):
     return f"ct_{strategy_code}_{symbol}_{stamp}"
 
 def place_trade(signal, qty):
+    """Submit simple fractional market order for $20 notional paper testing.
+
+    Stop and target are still logged for tracking/dashboard review.
+    Bracket orders are intentionally disabled for fractional paper testing.
+    """
     client_order_id = build_client_order_id(signal)
-
-    if USE_TRAILING_STOP:
-        from alpaca.trading.requests import TrailingStopOrderRequest
-
-        order = TrailingStopOrderRequest(
-            symbol=signal["symbol"],
-            qty=qty,
-            side=OrderSide.BUY,
-            time_in_force=TimeInForce.DAY,
-            trail_percent=TRAILING_STOP_PERCENT,
-            client_order_id=client_order_id
-        )
-
-        submitted_order = trading_client.submit_order(order)
-
-        log_trade_event(
-            bot_group="DIRECT_SCANNER",
-            strategy=signal.get("strategy", "unknown_strategy"),
-            model=signal.get("model", "direct_scanner_live_v1"),
-            symbol=signal["symbol"],
-            side="buy",
-            qty=qty,
-            entry_price=signal.get("entry", ""),
-            stop_loss="",
-            take_profit="",
-            status="ORDER_SUBMITTED",
-            order_id=getattr(submitted_order, "id", ""),
-            raw_payload={**signal, "client_order_id": client_order_id},
-        )
-
-        return submitted_order
 
     order = MarketOrderRequest(
         symbol=signal["symbol"],
         qty=qty,
         side=OrderSide.BUY,
         time_in_force=TimeInForce.DAY,
-        client_order_id=client_order_id,
-        order_class=OrderClass.BRACKET,
-        take_profit=TakeProfitRequest(limit_price=signal["target"]),
-        stop_loss=StopLossRequest(stop_price=signal["stop"])
+        client_order_id=client_order_id
     )
 
     submitted_order = trading_client.submit_order(order)
@@ -733,7 +704,6 @@ def place_trade(signal, qty):
     )
 
     return submitted_order
-
 
 def trades_placed_today():
     # Count from the bot_events Postgres table rather than the local CSV,
