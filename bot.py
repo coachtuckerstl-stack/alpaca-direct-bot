@@ -912,23 +912,19 @@ def run_bot():
             cycle_stats["skipped"] += 1
             print(f"{symbol}: SKIPPED - {reason}")
             log_event(symbol, "SKIPPED", reason)
-            continue
 
-        cycle_stats["signals_found"] += 1
-
-        # Risk check
-        approved, risk_reason, qty = risk_check(signal)
-
-        if not approved:
-            cycle_stats["blocked"] += 1
-            print(f"{symbol}: BLOCKED - {risk_reason}")
-            log_event(symbol, "BLOCKED", risk_reason)
             log_db_event(
-                event_type="SIGNAL_BLOCKED", symbol=symbol,
-                strategy=signal.get("strategy"), model=signal.get("model"),
-                status="BLOCKED", message=risk_reason, raw_payload=signal
-            )
-            continue
+            event_type="SIGNAL_SKIPPED",
+            symbol=symbol,
+            status="SKIPPED",
+            message=reason,
+            raw_payload={
+                "symbol": symbol,
+                "reason": reason
+            }
+        )
+
+        continue
 
         cycle_stats["orders_attempted"] += 1
         try:
